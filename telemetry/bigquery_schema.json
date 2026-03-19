@@ -1,0 +1,86 @@
+[
+  {
+    "name": "request_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "UUID4 assigned to each inference request"
+  },
+  {
+    "name": "timestamp_utc",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "UTC timestamp of the routing decision"
+  },
+  {
+    "name": "destination",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Routing destination: 'gcp_cloud_run' or 'aws_sagemaker'"
+  },
+  {
+    "name": "h_route",
+    "type": "FLOAT64",
+    "mode": "REQUIRED",
+    "description": "Aggregated Shannon entropy of attention distributions (routing signal)"
+  },
+  {
+    "name": "tau",
+    "type": "FLOAT64",
+    "mode": "REQUIRED",
+    "description": "Routing threshold tau active at decision time"
+  },
+  {
+    "name": "error_probability",
+    "type": "FLOAT64",
+    "mode": "NULLABLE",
+    "description": "P(error | h_route) from the isotonic regression calibrator"
+  },
+  {
+    "name": "input_tokens",
+    "type": "INT64",
+    "mode": "REQUIRED",
+    "description": "Number of tokens in the input after tokenization"
+  },
+  {
+    "name": "probe_latency_ms",
+    "type": "FLOAT64",
+    "mode": "NULLABLE",
+    "description": "Wall-clock time to compute entropy (ms)"
+  },
+  {
+    "name": "total_latency_ms",
+    "type": "FLOAT64",
+    "mode": "NULLABLE",
+    "description": "End-to-end inference latency including model call (ms)"
+  },
+  {
+    "name": "probe_model",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "HuggingFace model ID used as the entropy probe"
+  },
+  {
+    "name": "is_error",
+    "type": "BOOL",
+    "mode": "NULLABLE",
+    "description": "Ground-truth error label (populated asynchronously after human eval)"
+  },
+  {
+    "name": "model_label",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Output label returned by the downstream model"
+  },
+  {
+    "name": "model_score",
+    "type": "FLOAT64",
+    "mode": "NULLABLE",
+    "description": "Output confidence score returned by the downstream model"
+  },
+  {
+    "name": "metadata",
+    "type": "JSON",
+    "mode": "NULLABLE",
+    "description": "Arbitrary key-value metadata attached by the caller"
+  }
+]
