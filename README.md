@@ -124,7 +124,7 @@ FastAPI service that:
 Isotonic regression training:
 - Collects (predicted probability, actual outcome) pairs
 - Fits isotonic calibrator
-- Evalates calibration on held-out set
+- Evaluates calibration on held-out set
 - Deploys updated calibrator if improved
 
 ---
