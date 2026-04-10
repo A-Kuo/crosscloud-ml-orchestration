@@ -13,6 +13,7 @@ httpx>=0.27.0
 
 # Cloud SDKs (optional; mocked in tests)
 google-cloud-bigquery>=3.20.0
+google-cloud-firestore>=2.19.0
 boto3>=1.34.0
 
 # Airflow (local dev; install separately via pip install apache-airflow)
@@ -22,7 +23,6 @@ boto3>=1.34.0
 
 # Observability / logging
 structlog>=24.1.0
-prometheus-client>=0.20.0
 
 # Testing
 pytest>=8.2.0

@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import torch
+
+try:
+    import torch
+except Exception:  # pragma: no cover - optional heavy dep (e.g. broken DLL on some hosts)
+    pytest.skip("PyTorch is not available or failed to load", allow_module_level=True)
 
 from router.entropy import (
     AttentionEntropyProbe,

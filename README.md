@@ -1,159 +1,206 @@
-# Cross-Cloud ML Inference Orchestration
+# CrossCloud: Entropy-Based Multi-Cloud ML Inference Router
 
-**GCP Vertex AI + AWS SageMaker with Entropy-Based Routing**  
-Austin Kuo · aus.kuo03@gmail.com · Portfolio Project
+[![CI](https://github.com/austinkuo/crosscloud-orchestration/actions/workflows/ci.yml/badge.svg)](https://github.com/austinkuo/crosscloud-orchestration/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
----
-
-## Overview
-
-A production-grade, multi-cloud ML inference pipeline that routes requests across GCP and AWS based on **Shannon entropy of transformer attention distributions** — a mathematically-grounded uncertainty signal derived from model internals.
-
-| Entropy | Decision | Cloud |
-|---------|----------|-------|
-| H < τ (confident) | Fast path | GCP Cloud Run → BERT ABSA |
-| H ≥ τ (uncertain) | Escalate | AWS SageMaker → Hallucination scorer |
+A multi-cloud ML inference router that uses **Shannon entropy of transformer
+attention distributions** as a routing signal. Low-entropy (confident) requests
+go to a fast GCP Cloud Run endpoint; high-entropy (uncertain) requests are
+escalated to a heavier AWS SageMaker model. The routing threshold is
+recalibrated nightly via an Airflow DAG that detects distributional drift
+with KL divergence.
 
 ---
+
+## Architecture
+
+```
+                          ┌──────────────────────┐
+                          │     Input text        │
+                          └──────────┬───────────┘
+                                     ▼
+                          ┌──────────────────────┐
+                          │ AttentionEntropyProbe │
+                          │    (DistilBERT)       │
+                          └──────────┬───────────┘
+                                     ▼
+                          ┌──────────────────────┐
+                          │ H_route = mean entropy│
+                          │  across L layers,     │
+                          │  H heads, T tokens    │
+                          └──────────┬───────────┘
+                                     │
+                      ┌──────────────┴──────────────┐
+                      │                             │
+                 H < τ (confident)            H ≥ τ (uncertain)
+                      │                             │
+                      ▼                             ▼
+           ┌──────────────────┐          ┌──────────────────┐
+           │  GCP Cloud Run   │          │  AWS SageMaker   │
+           │  BERT ABSA       │          │  Hallucination   │
+           │  (fast path)     │          │  scorer (heavy)  │
+           └──────────────────┘          └──────────────────┘
+```
+
+**Nightly orchestration (Airflow):**
+
+```
+entropy_audit ──┬──► threshold_recalibrate ──┐
+                │                             ├──► health_check
+                └──► retrain_trigger ────────┘
+```
+
+## Mathematical Foundation
+
+| Concept | Formula | Role |
+|---------|---------|------|
+| Attention entropy | H(α) = −Σ p(a_i) log p(a_i) | Per-head uncertainty signal |
+| Routing signal | H_route = mean(H) over L layers × H heads | Scalar input to routing decision |
+| Threshold calibration | Isotonic regression: f(H) ≈ P(error \| H_route) | Adaptive τ from labeled data |
+| Drift detection | D_KL(P_current \|\| Q_baseline) on entropy histograms | Triggers recalibration or retraining |
+
+Threshold τ is not a fixed constant. It is the minimum H where
+P(error | H) ≥ ε (risk tolerance, default 0.15), recalibrated nightly from
+(entropy, error) pairs stored in BigQuery.
 
 ## Project Structure
 
 ```
-CrossCloud Orchestration/
+crosscloud-orchestration/
 ├── router/
-│   ├── entropy.py          # Shannon entropy from attention distributions
-│   ├── threshold.py        # Isotonic regression threshold calibration
-│   └── router.py           # Routing logic + RoutingDecision telemetry record
+│   ├── entropy.py           # AttentionEntropyProbe: attention → entropy → H_route
+│   ├── threshold.py         # ThresholdCalibrator: isotonic regression, AUROC, tau
+│   └── router.py            # InferenceRouter: probe + calibrator → RoutingDecision
 ├── inference/
-│   ├── models.py           # HuggingFace pipeline wrappers (ABSA + hallucination)
-│   ├── server.py           # FastAPI inference server
-│   └── Dockerfile          # Deployable to Cloud Run or SageMaker
-├── airflow/
-│   └── dags/
-│       └── crosscloud_orchestration.py  # Nightly orchestration DAG
+│   ├── server.py            # FastAPI: /infer, /entropy, /health
+│   ├── models.py            # HuggingFace pipeline wrappers (ABSA, hallucination)
+│   └── Dockerfile           # Multi-target: router | absa | hallucination
+├── airflow/dags/
+│   └── crosscloud_orchestration.py   # 4-task nightly DAG
 ├── telemetry/
-│   ├── bigquery_schema.json             # routing_events table schema
-│   └── sample_telemetry.py             # Synthetic telemetry generator
-├── tests/
-│   ├── test_entropy.py
-│   ├── test_threshold.py
-│   └── test_router.py
+│   ├── bigquery_schema.json          # routing_events table definition
+│   └── sample_telemetry.py           # Synthetic JSONL generator
+├── tests/                            # 45 fast + 4 slow tests
+├── .github/workflows/ci.yml          # GitHub Actions CI
+├── pyproject.toml
 ├── requirements.txt
-└── README.md
+└── DEVELOPMENT.md                    # Architecture deep-dive for contributors
 ```
-
----
-
-## Math
-
-**Attention entropy (per head):**
-```
-H(α_h_i) = −Σⱼ α_h_i_j · log(α_h_i_j)
-```
-
-**Aggregated routing signal:**
-```
-H_route = (1 / L·H) · Σ_{l,h,i} H(α_h_i)
-```
-
-**Threshold calibration (isotonic regression):**  
-Fit monotone function `f: ℝ → [0,1]` where `f(H) ≈ P(error | H_route)`.  
-τ is the minimum entropy where `f(H) ≥ ε` (risk tolerance).
-
-**Drift detection (KL divergence):**
-```
-D_KL(P ∥ Q) = Σ P(x) · log[P(x)/Q(x)]
-```
-- `D_KL > 0.1 nats` → recalibrate τ  
-- `D_KL > 0.3 nats` → trigger full retraining
-
----
 
 ## Quick Start
 
 ### Install
 
 ```bash
+git clone https://github.com/austinkuo/crosscloud-orchestration.git
+cd crosscloud-orchestration
 pip install -r requirements.txt
 ```
 
-### Run unit tests
+### Run Tests
 
 ```bash
-pytest                      # fast tests (no model download)
-pytest --runslow            # includes DistilBERT model tests
+pytest                   # fast tests — no model download, ~40s
+pytest --runslow         # full suite — downloads DistilBERT (~250 MB)
 ```
 
-### Generate sample telemetry
-
-```bash
-python telemetry/sample_telemetry.py --rows 2000 --out telemetry/sample_rows.jsonl
-```
-
-### Run inference server locally (router mode)
+### Start the Inference Server
 
 ```bash
 cd inference
 uvicorn server:app --host 0.0.0.0 --port 8080 --reload
 ```
 
-Then:
 ```bash
 curl -X POST http://localhost:8080/infer \
   -H "Content-Type: application/json" \
   -d '{"text": "The food was absolutely outstanding."}'
 ```
 
-### Build and run Docker
+### Docker
 
 ```bash
-# Local router mode
+# Router mode (local development)
 docker build -f inference/Dockerfile -t crosscloud-router .
 docker run -p 8080:8080 -e SERVE_TARGET=router crosscloud-router
 
-# GCP Cloud Run mode (ABSA fast path)
-docker build -f inference/Dockerfile -t crosscloud-absa \
-  --build-arg SERVE_TARGET=absa .
+# GCP Cloud Run target
+docker build -f inference/Dockerfile -t crosscloud-absa --build-arg SERVE_TARGET=absa .
 
-# AWS SageMaker mode (hallucination scorer)
-docker build -f inference/Dockerfile -t crosscloud-hallucination \
-  --build-arg SERVE_TARGET=hallucination .
+# AWS SageMaker target
+docker build -f inference/Dockerfile -t crosscloud-hallucination --build-arg SERVE_TARGET=hallucination .
 ```
 
-### Run Airflow DAG locally
+### Generate Telemetry Data
+
+```bash
+python telemetry/sample_telemetry.py --rows 2000 --out telemetry/sample_rows.jsonl
+```
+
+### Airflow (Local, Mocked Cloud)
 
 ```bash
 pip install apache-airflow
-export AIRFLOW_HOME=$(pwd)/airflow
-export MOCK_CLOUD=true
+export AIRFLOW_HOME=$(pwd)/airflow MOCK_CLOUD=true
 airflow db init
 airflow dags test crosscloud_ml_orchestration $(date +%Y-%m-%d)
 ```
 
----
-
-## Airflow DAG Tasks
+## Airflow DAG
 
 | Task | Trigger | Action |
 |------|---------|--------|
-| `entropy_audit` | Always | Query BigQuery 24h entropy; compute KL vs 30-day baseline |
-| `threshold_recalibrate` | KL > 0.1 | Refit isotonic regression; push τ to AWS SSM |
-| `retrain_trigger` | KL > 0.3 | Submit Vertex AI Pipeline retraining job |
-| `health_check` | Always | Ping both endpoints; alert if p99 > 150ms SLA |
+| `entropy_audit` | Always | Query 24h entropy from BigQuery; compute KL divergence vs 30-day baseline |
+| `threshold_recalibrate` | D_KL > 0.1 | Refit isotonic regression; push new τ to AWS SSM / GCP Secret Manager |
+| `retrain_trigger` | D_KL > 0.3 | Submit Vertex AI Pipeline retraining job |
+| `health_check` | Always | Ping both cloud endpoints; alert if p99 latency exceeds 150 ms SLA |
 
----
+## Configuration
 
-## Scope & Honest Framing
+All thresholds and endpoints are configurable via environment variables. See
+[DEVELOPMENT.md](DEVELOPMENT.md) for the full reference.
 
-**In scope (demonstrable):**
-- Entropy computation module with unit tests and AUROC benchmarks
-- Dockerized inference server deployable to Cloud Run or SageMaker
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SERVE_TARGET` | `router` | Server mode: `router`, `absa`, or `hallucination` |
+| `TAU` | 2.0 | Override routing threshold |
+| `PROBE_MODEL` | `distilbert-base-uncased` | HuggingFace model ID for the entropy probe |
+| `MOCK_CLOUD` | `true` | Gate real GCP/AWS SDK calls in Airflow |
+
+## Scope and Limitations
+
+**Demonstrated:**
+- Entropy computation module with full test coverage and AUROC benchmarks
+- Dockerised FastAPI server deployable to Cloud Run or SageMaker
 - Airflow DAG with mocked cross-cloud hooks, runnable locally
-- BigQuery schema and synthetic telemetry data
+- BigQuery telemetry schema with synthetic data generator
 
-**Out of scope:**
-- Full GCP/AWS account setup and IAM configuration
+**Out of scope (not claimed):**
+- Production IAM, VPC, and networking configuration
 - Real financial data or proprietary model weights
-- End-to-end load testing beyond local Docker simulation
+- Load testing beyond local Docker simulation
 
-The value of this project is in **architectural reasoning and mathematical rigor**, not in claiming production readiness that does not exist.
+The value of this project is in the **information-theoretic routing design
+and cross-cloud orchestration architecture**, not in claiming production
+readiness that does not exist.
+
+## Contributing
+
+See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for setup instructions,
+coding conventions, and the pull request workflow.
+
+## Citation
+
+```bibtex
+@software{crosscloud2026,
+  author = {Kuo, Austin},
+  title  = {{CrossCloud}: Entropy-Based Multi-Cloud {ML} Inference Routing},
+  year   = {2026},
+  url    = {https://github.com/austinkuo/crosscloud-orchestration},
+}
+```
+
+## License
+
+[Apache 2.0](LICENSE)

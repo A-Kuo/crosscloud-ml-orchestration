@@ -39,19 +39,27 @@ def generate_rows(
         base_time = datetime.now(timezone.utc) - timedelta(hours=24)
 
     rows = []
+    # AR(1) entropy with burst-sensitive drift component.
+    entropy_state = 1.7
+    current_time = base_time
     for i in range(n_rows):
-        # Bimodal entropy: 70% low-uncertainty, 30% high-uncertainty
-        if rng.random() < 0.70:
-            h = float(rng.normal(loc=1.4, scale=0.3))
-        else:
-            h = float(rng.normal(loc=2.5, scale=0.4))
-        h = max(0.0, h)
+        # Poisson inter-arrival with occasional bursty traffic.
+        arrival_rate = 1.8 if rng.random() > 0.08 else 0.2
+        delta_seconds = max(1, int(rng.exponential(60.0 / arrival_rate)))
+        current_time += timedelta(seconds=delta_seconds)
+
+        # AR(1): entropy_t = c + phi * entropy_{t-1} + noise
+        phi = 0.86
+        noise = rng.normal(loc=0.0, scale=0.18)
+        drift = 0.25 if rng.random() < 0.05 else 0.0
+        entropy_state = 0.22 + phi * entropy_state + noise + drift
+        h = max(0.0, float(entropy_state))
 
         destination = "gcp_cloud_run" if h < tau else "aws_sagemaker"
         error_prob = float(1 / (1 + np.exp(-(h - tau) * 3)))
         is_error = bool(rng.binomial(1, error_prob))
 
-        ts = base_time + timedelta(seconds=i * 86.4)  # spread evenly over 24h
+        ts = current_time
         probe_latency = float(rng.normal(loc=12.0, scale=2.5))
 
         if destination == "gcp_cloud_run":
@@ -63,9 +71,12 @@ def generate_rows(
             model_score = float(rng.uniform(0.5, 0.95))
             total_latency = probe_latency + float(rng.normal(loc=120.0, scale=20.0))
 
+        label_delay_hours = int(rng.integers(24, 73))
+
         rows.append({
             "request_id": str(uuid.uuid4()),
             "timestamp_utc": ts.isoformat(),
+            "label_available_utc": (ts + timedelta(hours=label_delay_hours)).isoformat(),
             "destination": destination,
             "h_route": round(h, 6),
             "tau": tau,

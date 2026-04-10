@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from router.entropy import EntropyResult
+from router.types import EntropyResult
 from router.router import InferenceRouter, RoutingDecision, RoutingDestination
 from router.threshold import ThresholdCalibrator
 
@@ -94,11 +94,12 @@ class TestInferenceRouter:
         decision = router.route("Test", metadata={"source": "api"})
         assert decision.metadata["source"] == "api"
 
-    def test_latency_ms_positive(self, calibrator):
+    def test_probe_latency_ms_positive(self, calibrator):
         probe = make_mock_probe(h_route=1.0)
         router = InferenceRouter(probe=probe, calibrator=calibrator)
         decision = router.route("Test input")
-        assert decision.latency_ms >= 0.0
+        assert decision.probe_latency_ms >= 0.0
+        assert decision.total_latency_ms is None
 
     def test_update_tau_changes_routing(self, calibrator):
         probe = make_mock_probe(h_route=1.5)
@@ -115,6 +116,9 @@ class TestInferenceRouter:
         router = InferenceRouter(probe=probe, calibrator=calibrator)
         decision = router.route("Test")
         d = decision.to_dict()
+        assert "probe_latency_ms" in d
+        assert "total_latency_ms" in d
+        assert d["total_latency_ms"] is None
         # Should be JSON-serialisable for BigQuery streaming
         serialised = json.dumps(d)
         assert "gcp_cloud_run" in serialised

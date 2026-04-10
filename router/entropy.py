@@ -13,33 +13,17 @@ Math reference (from spec):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel, PreTrainedTokenizer, PreTrainedModel
 
+from .types import EntropyResult
+
 logger = logging.getLogger(__name__)
 
 _EPS = 1e-12  # numerical stability floor to avoid log(0)
-
-
-@dataclass
-class EntropyResult:
-    """Detailed result from a single entropy computation pass."""
-    h_route: float                   # scalar routing signal (mean entropy)
-    per_head_entropies: np.ndarray   # shape: (n_layers, n_heads)
-    input_tokens: int                # number of tokens in the input
-    model_name: str
-
-    def to_dict(self) -> dict:
-        return {
-            "h_route": self.h_route,
-            "per_head_entropies": self.per_head_entropies.tolist(),
-            "input_tokens": self.input_tokens,
-            "model_name": self.model_name,
-        }
 
 
 class AttentionEntropyProbe:
@@ -133,9 +117,45 @@ class AttentionEntropyProbe:
             model_name=self.model_name,
         )
 
+    @torch.no_grad()
     def compute_batch(self, texts: List[str]) -> List[EntropyResult]:
-        """Convenience wrapper for a list of inputs."""
-        return [self.compute(t) for t in texts]
+        """
+        Compute entropy for multiple inputs in one transformer forward pass.
+        """
+        if not texts:
+            return []
+        encoding = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            max_length=self.max_length,
+            truncation=True,
+            padding=True,
+        )
+        input_ids = encoding["input_ids"].to(self.device)
+        attention_mask = encoding["attention_mask"].to(self.device)
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_attentions=True,
+        )
+        attentions: tuple = outputs.attentions
+        target_layers = attentions[-self.n_final_layers :]
+        batch_size = input_ids.shape[0]
+        results: List[EntropyResult] = []
+        for i in range(batch_size):
+            per_sample_layers = tuple(layer[i : i + 1] for layer in target_layers)
+            per_head_entropies = _compute_layer_head_entropies(per_sample_layers)
+            n_tokens = int(attention_mask[i].sum().item())
+            results.append(
+                EntropyResult(
+                    h_route=float(per_head_entropies.mean()),
+                    per_head_entropies=per_head_entropies,
+                    input_tokens=n_tokens,
+                    model_name=self.model_name,
+                )
+            )
+        return results
 
 
 # ---------------------------------------------------------------------------

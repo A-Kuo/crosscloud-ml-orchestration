@@ -19,15 +19,15 @@ PROBE_MODEL    : HuggingFace model ID for the entropy probe (router mode)
 
 from __future__ import annotations
 
-import logging
+import asyncio
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Optional
+from typing import Optional
 
 import structlog
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger(__name__)
@@ -37,27 +37,63 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 _router = None  # InferenceRouter  (router mode)
 _serve_target: str = os.getenv("SERVE_TARGET", "router").lower()
+_telemetry_writer = None
+_batch_queue: asyncio.Queue = asyncio.Queue()
+_batch_task: Optional[asyncio.Task] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _router
+    global _router, _telemetry_writer, _batch_task
     import sys
-    sys.path.insert(0, str(__file__ + "/../.."))  # make parent package importable
-    from router import InferenceRouter, AttentionEntropyProbe, ThresholdCalibrator
 
+    sys.path.insert(0, str(__file__ + "/../.."))  # make parent package importable
+    from inference.config import load_runtime_config
+    from telemetry.writer import from_env
+
+    _telemetry_writer = from_env()
+    _telemetry_writer.start()
     if _serve_target == "router":
-        tau_override = os.getenv("TAU")
+        from router import (
+            AttentionEntropyProbe,
+            CalibrationArtifactManager,
+            InferenceRouter,
+            TemporalDriftController,
+            ThresholdCalibrator,
+        )
+        runtime = load_runtime_config()
+        tau_override = runtime.tau
         probe_model = os.getenv("PROBE_MODEL", "distilbert-base-uncased")
         probe = AttentionEntropyProbe(model_name=probe_model)
         calibrator = ThresholdCalibrator()
+
+        # Prefer runtime config (env/file/firestore), fallback to latest artifact.
         if tau_override:
             calibrator.update_tau(float(tau_override))
-        _router = InferenceRouter(probe=probe, calibrator=calibrator)
-        logger.info("Router mode initialised", tau=calibrator.tau)
+        else:
+            artifact = CalibrationArtifactManager().load_latest()
+            if artifact is not None and artifact.is_valid():
+                calibrator.update_tau(artifact.tau)
+
+        temporal = TemporalDriftController(
+            window_size=int(os.getenv("TEMPORAL_WINDOW_SIZE", "200")),
+            z_threshold=float(os.getenv("TEMPORAL_Z_THRESHOLD", "2.0")),
+            tau_offset=float(os.getenv("TEMPORAL_TAU_OFFSET", "-0.2")),
+        )
+        _router = InferenceRouter(probe=probe, calibrator=calibrator, temporal_controller=temporal)
+        _batch_task = asyncio.create_task(_batch_worker(), name="router-batch-worker")
+        logger.info("Router mode initialised", tau=calibrator.tau, config_source=runtime.source)
     else:
         logger.info("Single-model mode", target=_serve_target)
     yield
+    if _batch_task is not None:
+        _batch_task.cancel()
+        try:
+            await _batch_task
+        except asyncio.CancelledError:
+            pass
+    if _telemetry_writer is not None:
+        await _telemetry_writer.stop()
     logger.info("Server shutting down")
 
 
@@ -135,7 +171,7 @@ async def compute_entropy(req: InferRequest) -> EntropyResponse:
 
 
 @app.post("/infer", response_model=InferResponse, tags=["inference"])
-async def infer(req: InferRequest) -> InferResponse:
+async def infer(req: InferRequest, request: Request, response: Response) -> InferResponse:
     """
     Full inference pipeline:
     1. Compute attention entropy via the probe model.
@@ -143,22 +179,23 @@ async def infer(req: InferRequest) -> InferResponse:
     3. Run the appropriate model and return results.
     """
     t0 = time.perf_counter()
+    from telemetry.tracing import new_trace, trace_headers
+    trace_ctx = new_trace(trace_id=request.headers.get("X-Trace-ID"))
+    response.headers.update(trace_headers(trace_ctx))
 
     if _serve_target == "router" and _router is not None:
-        return await _handle_router_mode(req, t0)
+        result = await _handle_router_mode(req, t0, trace_ctx.trace_id)
+        return result
 
     # Single-model mode (deployed on the actual cloud endpoint)
-    return await _handle_single_model_mode(req, t0)
+    result = await _handle_single_model_mode(req, t0)
+    return result
 
 
-async def _handle_router_mode(req: InferRequest, t0: float) -> InferResponse:
+async def _handle_router_mode(req: InferRequest, t0: float, trace_id: str) -> InferResponse:
     from inference.models import run_absa, run_hallucination_scorer
 
-    decision = _router.route(
-        text=req.text,
-        request_id=req.request_id,
-        metadata={"has_hypothesis": req.hypothesis is not None},
-    )
+    decision = await _compute_entropy_routed_decision(req, trace_id)
 
     if decision.destination.value == "gcp_cloud_run":
         model_result = run_absa(req.text)
@@ -166,6 +203,9 @@ async def _handle_router_mode(req: InferRequest, t0: float) -> InferResponse:
         model_result = run_hallucination_scorer(req.text, req.hypothesis)
 
     total_latency = (time.perf_counter() - t0) * 1000.0
+    decision.total_latency_ms = total_latency
+    if _telemetry_writer is not None:
+        await _telemetry_writer.write(decision.to_dict())
 
     return InferResponse(
         request_id=decision.request_id,
@@ -201,6 +241,67 @@ async def _handle_single_model_mode(req: InferRequest, t0: float) -> InferRespon
         latency_ms=total_latency,
         timestamp_utc=time.time(),
     )
+
+
+async def _compute_entropy_routed_decision(req: InferRequest, trace_id: str):
+    if _batch_task is None:
+        return _router.route(
+            text=req.text,
+            request_id=req.request_id,
+            metadata={"has_hypothesis": req.hypothesis is not None, "trace_id": trace_id},
+        )
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    await _batch_queue.put((req, trace_id, future))
+    return await future
+
+
+async def _batch_worker() -> None:
+    """
+    Collect incoming requests and compute entropy in true batches.
+    """
+    while True:
+        req, trace_id, fut = await _batch_queue.get()
+        batch = [(req, trace_id, fut)]
+        deadline = asyncio.get_running_loop().time() + float(os.getenv("BATCH_WINDOW_MS", "8")) / 1000.0
+        max_batch = int(os.getenv("MAX_BATCH_SIZE", "16"))
+        while len(batch) < max_batch:
+            timeout = deadline - asyncio.get_running_loop().time()
+            if timeout <= 0:
+                break
+            try:
+                batch.append(await asyncio.wait_for(_batch_queue.get(), timeout=timeout))
+            except asyncio.TimeoutError:
+                break
+        texts = [item[0].text for item in batch]
+        batch_t0 = time.perf_counter()
+        results = await asyncio.to_thread(_router.probe.compute_batch, texts)
+        per_item_probe_latency = ((time.perf_counter() - batch_t0) * 1000.0) / max(1, len(results))
+        for (req_i, trace_id_i, fut_i), entropy_result in zip(batch, results):
+            try:
+                h = entropy_result.h_route
+                tau = _router.tau
+                if getattr(_router, "_temporal", None) is not None:
+                    _router._temporal.update(h)
+                    tau = _router._temporal.adjusted_tau(tau)
+                error_prob = _router._calibrator.predict_error_prob(h)
+                from router.router import RoutingDecision, RoutingDestination
+                decision = RoutingDecision(
+                    request_id=req_i.request_id or str(uuid.uuid4()),
+                    destination=RoutingDestination.AWS_SAGEMAKER if h >= tau else RoutingDestination.GCP_CLOUD_RUN,
+                    h_route=h,
+                    tau=tau,
+                    error_probability=error_prob,
+                    input_tokens=entropy_result.input_tokens,
+                    probe_latency_ms=per_item_probe_latency,
+                    total_latency_ms=None,
+                    timestamp_utc=time.time(),
+                    model_name=entropy_result.model_name,
+                    metadata={"has_hypothesis": req_i.hypothesis is not None, "trace_id": trace_id_i},
+                )
+                fut_i.set_result(decision)
+            except Exception as exc:  # pragma: no cover - defensive
+                fut_i.set_exception(exc)
 
 
 if __name__ == "__main__":

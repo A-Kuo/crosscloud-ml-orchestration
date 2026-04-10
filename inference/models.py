@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
-import torch
-from transformers import pipeline, Pipeline
+if TYPE_CHECKING:
+    from transformers import Pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ ModelTarget = Literal["absa", "hallucination"]
 
 
 @lru_cache(maxsize=2)
-def load_model(target: ModelTarget) -> Pipeline:
+def load_model(target: ModelTarget) -> Any:
     """
     Load and cache a HuggingFace pipeline for the given target.
 
@@ -34,6 +34,9 @@ def load_model(target: ModelTarget) -> Pipeline:
     hallucination -> vectara/hallucination_evaluation_model
                      (a cross-encoder scoring factual consistency)
     """
+    import torch
+    from transformers import pipeline
+
     device = 0 if torch.cuda.is_available() else -1
 
     if target == "absa":
