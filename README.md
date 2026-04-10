@@ -6,7 +6,7 @@
 [![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-2.7+-green.svg)](https://airflow.apache.org)
 [![GCP](https://img.shields.io/badge/GCP%20Vertex%20AI-supported-blue.svg)](https://cloud.google.com/vertex-ai)
 [![AWS](https://img.shields.io/badge/AWS%20SageMaker-supported-orange.svg)](https://aws.amazon.com/sagemaker)
-[![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen.svg)]()
+[![Status](https://img.shields.io/badge/Status-Beta-green.svg)]()
 
 > *"Most multi-cloud ML implementations route by latency or cost. They ignore the most important signal: which model actually knows what it's talking about for this specific input."*
 
@@ -174,6 +174,14 @@ telemetry:
 ```
 
 ---
+
+## Installation
+
+```bash
+git clone https://github.com/A-Kuo/crosscloud-ml-orchestration.git
+cd crosscloud-ml-orchestration
+pip install -r requirements.txt
+```
 
 ## Usage
 
