@@ -78,6 +78,18 @@
     "description": "Output confidence score returned by the downstream model"
   },
   {
+    "name": "cost_per_request_usd",
+    "type": "FLOAT64",
+    "mode": "NULLABLE",
+    "description": "Estimated inference cost in USD for this request (based on instance type, tokens, and duration)"
+  },
+  {
+    "name": "cost_model",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Pricing model used: 'gcp_cloud_run_per_request' or 'aws_sagemaker_per_hour'"
+  },
+  {
     "name": "metadata",
     "type": "JSON",
     "mode": "NULLABLE",
